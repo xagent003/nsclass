@@ -38,7 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	corev1alpha1 "github.com/xagent003/nsclass/api/v1alpha1"
-	"github.com/xagent003/nsclass/internal/controller"
+	"github.com/xagent003/nsclass/internal/controllers/namespace"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -202,20 +202,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.NamespaceClassReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "NamespaceClass")
-		os.Exit(1)
-	}
-	if err = (&controller.NamespaceReconciler{
+	/*
+		if err = (&namespaceclass.NamespaceClassReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "NamespaceClass")
+			os.Exit(1)
+		}
+	*/
+
+	if err = (&namespace.NamespaceReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Namespace")
 		os.Exit(1)
 	}
+
 	// +kubebuilder:scaffold:builder
 
 	if metricsCertWatcher != nil {
