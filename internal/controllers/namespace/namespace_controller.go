@@ -251,6 +251,36 @@ func (r *NamespaceReconciler) reconcileResource(ctx context.Context, nsScope *sc
 	obj.SetName(resource.ObjectMeta.Name)
 	obj.SetNamespace(nsScope.Namespace.Name)
 
+	// Decided to move this here since resources may have immutable fields and a Update or Patch
+	// will fail. Since we can support ANY resource, it is complex to figure out the merging logic
+	// For example if we don't specify "spec.foo" we can't know whether we want to remove that field
+	// or leave it untouched. Or if namespace class changes "spec.foo: 1" to "2"
+	// For example Patch (or createOrPatch) even fails on a no-op reconciliation for a Pod since our template
+	// only contains a few fields and k8s Pod controller adds a lot more.
+	// As such, make the entire template immutable, we can only support adding or removing resources or changing metadata
+
+	if resource.SpecTemplate != nil {
+		var specMap map[string]interface{}
+		if err := json.Unmarshal(resource.SpecTemplate.Raw, &specMap); err != nil {
+			log.Error(err, "failed to unmarshal spec template", "resource", resource.ObjectMeta)
+			return fmt.Errorf("failed to unmarshal spec template: %w", err)
+		}
+
+		/* does not work for resources without a spec
+		log.Info("applying", "spec", specMap)
+		if err := unstructured.SetNestedField(obj.Object, specMap, "spec"); err != nil {
+			return fmt.Errorf("failed to set spec: %w", err)
+		}
+		*/
+		for k, v := range specMap {
+			// Skip apiVersion, kind, and metadata as they're handled separately
+			if k != "apiVersion" && k != "kind" && k != "metadata" {
+				log.Info("applying field", "field", k, "value", v)
+				obj.Object[k] = v
+			}
+		}
+	}
+
 	op, err := controllerutil.CreateOrPatch(ctx, r.Client, obj, func() error {
 		if resource.ObjectMeta.Labels != nil {
 			existingLabels := obj.GetLabels()
@@ -272,21 +302,6 @@ func (r *NamespaceReconciler) reconcileResource(ctx context.Context, nsScope *sc
 				existingAnnotations[k] = v
 			}
 			obj.SetAnnotations(existingAnnotations)
-		}
-
-		if resource.SpecTemplate != nil {
-			var specMap map[string]interface{}
-			if err := json.Unmarshal(resource.SpecTemplate.Raw, &specMap); err != nil {
-				log.Error(err, "Failed to unmarshal spec template")
-				return fmt.Errorf("failed to unmarshal spec template: %w", err)
-			}
-			for k, v := range specMap {
-				// Skip apiVersion, kind, and metadata as they're handled separately
-				if k != "apiVersion" && k != "kind" && k != "metadata" {
-					log.Info("applying field", "field", k, "value", v)
-					obj.Object[k] = v
-				}
-			}
 		}
 
 		return controllerutil.SetControllerReference(nsScope.Class, obj, r.Scheme)
