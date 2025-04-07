@@ -7,7 +7,7 @@ At present, a namespace can only belong to one class. A namespace can change cla
 to the old class to be cleaned up. A namespace can also specify a class that doesn't exist, and when the NamespaceClass
 is created, it's resources will be applied in everyname space that has a label for it
 
-Any resource type is supported, including other Custom Resources.
+Any resource type is supported, including other Custom Resources. RBAC for creating NamespaceClasses should be tightly locked down for this reason, as it can allow injecting arbitrary resources that may not normally be allowed. Due to this the operator has * rbac privileges for all API groups and types
 
 Resources can also be added to or removed from a NamespaceClass which will trigger application and/or cleanup in all namespaces that target this class.
 
