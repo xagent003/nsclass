@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: docker.io/xagent003/nsclass
-  newTag: "5"
+  newTag: "7"

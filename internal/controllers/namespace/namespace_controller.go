@@ -14,7 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	k8serrors "k8s.io/apimachinery/pkg/util/errors"
-	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -94,11 +93,6 @@ func (r *NamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return r.reconcileDelete(ctx, nsScope)
 	}
 
-	if !controllerutil.ContainsFinalizer(nsScope.Namespace, v1alpha1.NamespaceWithClassFinalizer) {
-		controllerutil.AddFinalizer(nsScope.Namespace, v1alpha1.NamespaceWithClassFinalizer)
-		return ctrl.Result{Requeue: true}, nil
-	}
-
 	return r.reconcileNormal(ctx, nsScope)
 }
 
@@ -127,10 +121,6 @@ func (r *NamespaceReconciler) reconcileDelete(ctx context.Context, nsScope *scop
 func (r *NamespaceReconciler) reconcileNormal(ctx context.Context, nsScope *scope.NamespaceScope) (ctrl.Result, error) {
 	log := nsScope.Logger
 
-	if nsScope.Class == nil {
-		return r.reconcileNoClass(ctx, nsScope)
-	}
-
 	// The benefit of namespace controller vs namepaceclass is we can strictly control order
 	// For example when a namespace switches classes, we remove all old resources FIRST
 	// Then we reconcile current (or new, if it switched) resources. If current class removed resources
@@ -139,8 +129,20 @@ func (r *NamespaceReconciler) reconcileNormal(ctx context.Context, nsScope *scop
 	// With th namespaceclass controller implementation, we can't guarantee ordering of which NSClass
 	// is reconciled first. For example in the case of a class switch, if the new class iss
 	// reconciled first, the new resources would be applied before removal of the old class's
-	if res, err := r.handleClassSwitching(ctx, nsScope); !res.IsZero() || err != nil {
+	// Handle any class changes (cleanup old resources if needed)
+
+	if res, err := r.reconcileClassChange(ctx, nsScope); !res.IsZero() || err != nil {
 		return res, err
+	}
+
+	// If no class is associated, we're done
+	if nsScope.Class == nil {
+		return ctrl.Result{}, nil
+	}
+
+	if !controllerutil.ContainsFinalizer(nsScope.Namespace, v1alpha1.NamespaceWithClassFinalizer) {
+		controllerutil.AddFinalizer(nsScope.Namespace, v1alpha1.NamespaceWithClassFinalizer)
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	if err := r.reconcileClassResources(ctx, nsScope); err != nil {
@@ -148,11 +150,7 @@ func (r *NamespaceReconciler) reconcileNormal(ctx context.Context, nsScope *scop
 		return ctrl.Result{}, err
 	}
 
-	// Use an annotation to track applied status here since this is a core type, not CRD we own
-	if nsScope.Namespace.Annotations == nil {
-		nsScope.Namespace.Annotations = make(map[string]string)
-	}
-	nsScope.Namespace.Annotations[v1alpha1.NamespaceAppliedClassAnnotation] = nsScope.Class.Name
+	r.setAppliedClassAnnotation(nsScope)
 
 	// Update the NamespaceClass status with resources applied to this namespace
 	if err := r.updateNamespaceClassStatus(ctx, nsScope); err != nil {
@@ -164,52 +162,36 @@ func (r *NamespaceReconciler) reconcileNormal(ctx context.Context, nsScope *scop
 	return ctrl.Result{}, nil
 }
 
-func (r *NamespaceReconciler) reconcileNoClass(ctx context.Context, nsScope *scope.NamespaceScope) (ctrl.Result, error) {
-	log := ctrllog.FromContext(ctx).WithValues("namespace", nsScope.Namespace.Name)
-
-	// Check if a class was previously applied
-	appliedClassName, applied := nsScope.Namespace.Annotations[v1alpha1.NamespaceAppliedClassAnnotation]
-	if !applied || appliedClassName == "" {
-		log.Info("Namespace does not have a previously applied class")
-		return ctrl.Result{}, nil
-	}
-
-	log.Info("Namespace no longer has a NamespaceClass label, cleaning up resources")
-	if err := r.cleanupClassResources(ctx, nsScope, appliedClassName); err != nil {
-		log.Error(err, "Failed to clean up resources")
-		return ctrl.Result{}, err
-	}
-
-	if err := r.removeAppliedClassAnnotation(ctx, nsScope.Namespace); err != nil {
-		log.Error(err, "Failed to remove applied class annotation")
-		return ctrl.Result{}, err
-	}
-
-	if err := r.removeNamespaceFromClassStatus(ctx, nsScope.Namespace.Name, appliedClassName); err != nil {
-		log.Error(err, "Failed to remove namespace from class status")
-		return ctrl.Result{}, err
-	}
-
-	return ctrl.Result{}, nil
-}
-
-func (r *NamespaceReconciler) handleClassSwitching(ctx context.Context, nsScope *scope.NamespaceScope) (ctrl.Result, error) {
+func (r *NamespaceReconciler) reconcileClassChange(ctx context.Context, nsScope *scope.NamespaceScope) (ctrl.Result, error) {
 	log := nsScope.Logger
 	namespace := nsScope.Namespace
+	currentClass := nsScope.Class
 
+	// Check if a class was previously applied
 	appliedClassName, applied := namespace.Annotations[v1alpha1.NamespaceAppliedClassAnnotation]
-	if !applied || appliedClassName == "" || appliedClassName == nsScope.Class.Name {
+
+	if !applied || appliedClassName == "" || (currentClass != nil && appliedClassName == currentClass.Name) {
 		return ctrl.Result{}, nil
 	}
 
-	log.Info("Namespace changed NamespaceClass", "oldClass", appliedClassName, "newClass", nsScope.Class.Name)
+	if currentClass == nil {
+		log.Info("Namespace no longer has a NamespaceClass label, cleaning up resources")
+	} else {
+		log.Info("Namespace changed NamespaceClass", "old", appliedClassName, "new", currentClass.Name)
+	}
+
 	if err := r.cleanupClassResources(ctx, nsScope, appliedClassName); err != nil {
 		log.Error(err, "Failed to clean up resources from old class")
 		return ctrl.Result{}, err
 	}
 
-	if err := r.removeNamespaceFromClassStatus(ctx, nsScope.Namespace.Name, appliedClassName); err != nil {
+	if err := r.removeNamespaceFromClassStatus(ctx, namespace.Name, appliedClassName); err != nil {
 		log.Error(err, "Failed to remove namespace from old class status")
+		return ctrl.Result{}, err
+	}
+
+	if err := r.removeAppliedClassAnnotation(ctx, namespace); err != nil {
+		log.Error(err, "Failed to remove applied class annotation")
 		return ctrl.Result{}, err
 	}
 
@@ -372,18 +354,21 @@ func (r *NamespaceReconciler) cleanupClassResources(ctx context.Context, nsScope
 	return k8serrors.NewAggregate(errs)
 }
 
+// Use an annotation to track applied status here since this is a core type, not CRD we own
+func (r *NamespaceReconciler) setAppliedClassAnnotation(nsScope *scope.NamespaceScope) {
+	if nsScope.Namespace.Annotations == nil {
+		nsScope.Namespace.Annotations = make(map[string]string)
+	}
+	nsScope.Namespace.Annotations[v1alpha1.NamespaceAppliedClassAnnotation] = nsScope.Class.Name
+}
+
 func (r *NamespaceReconciler) removeAppliedClassAnnotation(ctx context.Context, namespace *corev1.Namespace) error {
 	if namespace.Annotations == nil || namespace.Annotations[v1alpha1.NamespaceAppliedClassAnnotation] == "" {
 		return nil
 	}
 
-	patchHelper, err := patch.NewHelper(namespace, r.Client)
-	if err != nil {
-		return err
-	}
-
 	delete(namespace.Annotations, v1alpha1.NamespaceAppliedClassAnnotation)
-	return patchHelper.Patch(ctx, namespace)
+	return nil
 }
 
 func (r *NamespaceReconciler) updateNamespaceClassStatus(ctx context.Context, nsScope *scope.NamespaceScope) error {
